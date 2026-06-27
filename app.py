@@ -4,6 +4,8 @@ import json
 import math
 import zipfile
 import sqlite3
+import urllib.request
+import urllib.parse
 from datetime import datetime, timezone, timedelta
 
 import numpy as np
@@ -16,6 +18,7 @@ except Exception:
     yf = None
 
 APP_NAME = "BTC Regime Research Logger"
+APP_VERSION = "v4_binance_coinbase_bootstrap"
 DB_PATH = os.getenv("DB_PATH", "/data/btc_research.sqlite" if os.path.exists("/data") else "btc_research.sqlite")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
 BOOTSTRAP_ON_START = os.getenv("BOOTSTRAP_ON_START", "true").lower() in ("1", "true", "yes", "y")
@@ -758,31 +761,282 @@ def update_all_trades():
         conn.commit()
 
 
-def bootstrap_yfinance(force=False):
-    if yf is None:
-        return {"ok": False, "message": "yfinance not installed"}
-    with connect() as conn:
-        count = conn.execute("SELECT COUNT(*) AS n FROM candles_1h").fetchone()["n"]
-    if count > 0 and not force:
-        return {"ok": True, "message": f"Skipped bootstrap; {count} candles already in DB", "candles": count}
-    raw = yf.download(TICKER, interval="1h", period=BOOTSTRAP_PERIOD, auto_adjust=False, progress=False, threads=True)
+def _normalise_yfinance_ohlcv(raw):
+    """Return a clean OHLCV dataframe from yfinance output, or empty dataframe."""
     if raw is None or raw.empty:
-        return {"ok": False, "message": "No data from yfinance"}
+        return pd.DataFrame()
     df = raw.copy()
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [c[0] for c in df.columns]
-    df.columns = [str(c).lower().replace(" ", "_") for c in df.columns]
-    df = df.rename(columns={"adj_close": "adj_close"})
+    df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
     needed = ["open", "high", "low", "close", "volume"]
+    if not all(c in df.columns for c in needed):
+        return pd.DataFrame()
     df = df[needed].dropna()
+    if df.empty:
+        return pd.DataFrame()
     df.index = pd.to_datetime(df.index, utc=True)
+    df = df[~df.index.duplicated(keep="last")].sort_index()
+    return df
+
+
+def _period_days(period):
+    """Convert simple period strings like 730d, 365d, 24mo into approximate days."""
+    s = str(period or "730d").strip().lower()
+    try:
+        if s.endswith("d"):
+            return max(1, int(float(s[:-1])))
+        if s.endswith("mo"):
+            return max(1, int(float(s[:-2]) * 30))
+        if s.endswith("y"):
+            return max(1, int(float(s[:-1]) * 365))
+        return max(1, int(float(s)))
+    except Exception:
+        return 730
+
+
+def _period_bounds_utc(period):
+    days = _period_days(period)
+    now = datetime.now(timezone.utc)
+    # Use the last fully closed hourly candle, not the currently-forming one.
+    end = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1)
+    start = end - timedelta(days=days)
+    return start, end
+
+
+def _http_json(url, timeout=20):
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 BTC-Regime-Research-Logger/1.0",
+            "Accept": "application/json,text/plain,*/*",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = resp.read().decode("utf-8")
+    return json.loads(body)
+
+
+def _yfinance_period_candidates(period):
+    """Yahoo can occasionally reject/return empty for 730d. Try safer fallbacks."""
+    candidates = []
+    for x in [period, "729d", "720d", "365d", "180d", "90d", "60d", "30d"]:
+        if x and x not in candidates:
+            candidates.append(x)
+    return candidates
+
+
+def _download_btc_yfinance(ticker, period):
+    attempts = []
+    if yf is None:
+        return pd.DataFrame(), [{"method": "yfinance", "error": "yfinance not installed"}], None, None
+    for p in _yfinance_period_candidates(period):
+        # Method 1: yf.download. Keep threads off on Railway; it is more predictable.
+        try:
+            raw = yf.download(
+                ticker,
+                interval="1h",
+                period=p,
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+            )
+            df = _normalise_yfinance_ohlcv(raw)
+            attempts.append({"method": "yf.download", "ticker": ticker, "period": p, "rows": int(len(df))})
+            if not df.empty:
+                return df, attempts, p, "yf.download"
+        except Exception as e:
+            attempts.append({"method": "yf.download", "ticker": ticker, "period": p, "error": str(e)[:250]})
+
+        # Method 2: Ticker.history fallback.
+        try:
+            raw = yf.Ticker(ticker).history(
+                interval="1h",
+                period=p,
+                auto_adjust=False,
+                actions=False,
+            )
+            df = _normalise_yfinance_ohlcv(raw)
+            attempts.append({"method": "Ticker.history", "ticker": ticker, "period": p, "rows": int(len(df))})
+            if not df.empty:
+                return df, attempts, p, "Ticker.history"
+        except Exception as e:
+            attempts.append({"method": "Ticker.history", "ticker": ticker, "period": p, "error": str(e)[:250]})
+
+    return pd.DataFrame(), attempts, None, None
+
+
+def _download_btc_binance(period, symbol=None):
+    """Bootstrap BTCUSDT hourly candles from Binance public klines. No API key."""
+    symbol = (symbol or os.getenv("BOOTSTRAP_BINANCE_SYMBOL", "BTCUSDT")).upper().strip()
+    start, end = _period_bounds_utc(period)
+    start_ms = int(start.timestamp() * 1000)
+    end_ms = int((end + timedelta(minutes=59, seconds=59)).timestamp() * 1000)
+    attempts = []
+    rows = []
+    cursor = start_ms
+    limit = 1000
+
+    while cursor <= end_ms:
+        params = urllib.parse.urlencode({
+            "symbol": symbol,
+            "interval": "1h",
+            "limit": limit,
+            "startTime": cursor,
+            "endTime": end_ms,
+        })
+        url = f"https://api.binance.com/api/v3/klines?{params}"
+        try:
+            data = _http_json(url, timeout=25)
+            attempts.append({"method": "binance.klines", "symbol": symbol, "start_ms": cursor, "rows": len(data) if isinstance(data, list) else 0})
+        except Exception as e:
+            attempts.append({"method": "binance.klines", "symbol": symbol, "start_ms": cursor, "error": str(e)[:250]})
+            break
+
+        if not isinstance(data, list) or not data:
+            break
+
+        rows.extend(data)
+        last_open_ms = int(data[-1][0])
+        next_cursor = last_open_ms + 60 * 60 * 1000
+        if next_cursor <= cursor:
+            break
+        cursor = next_cursor
+        if len(data) < limit:
+            break
+
+    if not rows:
+        return pd.DataFrame(), attempts, symbol, "binance.klines"
+
+    out = []
+    for k in rows:
+        # Binance kline: open time, open, high, low, close, volume, close time, ...
+        out.append({
+            "timestamp": pd.to_datetime(int(k[0]), unit="ms", utc=True),
+            "open": float(k[1]),
+            "high": float(k[2]),
+            "low": float(k[3]),
+            "close": float(k[4]),
+            "volume": float(k[5]),
+        })
+    df = pd.DataFrame(out).dropna()
+    if df.empty:
+        return pd.DataFrame(), attempts, symbol, "binance.klines"
+    df = df.drop_duplicates("timestamp", keep="last").sort_values("timestamp").set_index("timestamp")
+    return df[["open", "high", "low", "close", "volume"]], attempts, symbol, "binance.klines"
+
+
+def _download_btc_coinbase(period, product=None):
+    """Bootstrap BTC-USD hourly candles from Coinbase Exchange public candles. No API key."""
+    product = (product or os.getenv("BOOTSTRAP_COINBASE_PRODUCT", "BTC-USD")).upper().strip()
+    start, end = _period_bounds_utc(period)
+    attempts = []
+    rows = []
+    chunk = timedelta(hours=299)  # Coinbase max is around 300 candles.
+    cursor = start
+
+    while cursor < end:
+        chunk_end = min(cursor + chunk, end)
+        params = urllib.parse.urlencode({
+            "granularity": 3600,
+            "start": cursor.isoformat().replace("+00:00", "Z"),
+            "end": chunk_end.isoformat().replace("+00:00", "Z"),
+        })
+        url = f"https://api.exchange.coinbase.com/products/{urllib.parse.quote(product)}/candles?{params}"
+        try:
+            data = _http_json(url, timeout=25)
+            attempts.append({"method": "coinbase.candles", "product": product, "start": cursor.isoformat(), "rows": len(data) if isinstance(data, list) else 0})
+        except Exception as e:
+            attempts.append({"method": "coinbase.candles", "product": product, "start": cursor.isoformat(), "error": str(e)[:250]})
+            break
+
+        if isinstance(data, list) and data:
+            rows.extend(data)
+        cursor = chunk_end + timedelta(hours=1)
+
+    if not rows:
+        return pd.DataFrame(), attempts, product, "coinbase.candles"
+
+    out = []
+    for c in rows:
+        # Coinbase candle: [time, low, high, open, close, volume]
+        if len(c) < 6:
+            continue
+        out.append({
+            "timestamp": pd.to_datetime(int(c[0]), unit="s", utc=True),
+            "open": float(c[3]),
+            "high": float(c[2]),
+            "low": float(c[1]),
+            "close": float(c[4]),
+            "volume": float(c[5]),
+        })
+    df = pd.DataFrame(out).dropna()
+    if df.empty:
+        return pd.DataFrame(), attempts, product, "coinbase.candles"
+    df = df.drop_duplicates("timestamp", keep="last").sort_values("timestamp").set_index("timestamp")
+    return df[["open", "high", "low", "close", "volume"]], attempts, product, "coinbase.candles"
+
+
+def bootstrap_yfinance(force=False, ticker=None, period=None):
+    """Historical candle bootstrap. Name kept for compatibility; now tries Yahoo, Binance and Coinbase."""
+    ticker = ticker or TICKER
+    period = period or BOOTSTRAP_PERIOD
+    all_attempts = []
+
+    with connect() as conn:
+        count = conn.execute("SELECT COUNT(*) AS n FROM candles_1h").fetchone()["n"]
+    if count > 0 and not force:
+        return {"ok": True, "version": APP_VERSION, "message": f"Skipped bootstrap; {count} candles already in DB", "candles": count}
+
+    # 1) Try Yahoo first because it matches the Colab source.
+    df, attempts, used_period, used_method = _download_btc_yfinance(ticker, period)
+    all_attempts.extend(attempts)
+    used_source = "yfinance"
+    used_symbol = ticker
+
+    # 2) Railway sometimes gets empty Yahoo data. Binance hourly klines are a robust no-key fallback.
+    if df.empty:
+        df, attempts, used_symbol, used_method = _download_btc_binance(period)
+        all_attempts.extend(attempts)
+        used_period = period
+        used_source = "binance"
+
+    # 3) Coinbase fallback if Binance is blocked/unavailable.
+    if df.empty:
+        df, attempts, used_symbol, used_method = _download_btc_coinbase(period)
+        all_attempts.extend(attempts)
+        used_period = period
+        used_source = "coinbase"
+
+    if df.empty:
+        log_event("bootstrap_error", "No historical data from Yahoo, Binance or Coinbase", {"ticker": ticker, "period": period, "attempts": all_attempts})
+        return {
+            "ok": False,
+            "version": APP_VERSION,
+            "message": "No historical data from Yahoo, Binance or Coinbase",
+            "ticker": ticker,
+            "period": period,
+            "attempts": all_attempts[-20:],
+        }
+
     rows = 0
     for ts, r in df.iterrows():
-        upsert_candle(ts, TICKER, float(r.open), float(r.high), float(r.low), float(r.close), float(r.volume), source="yfinance")
+        upsert_candle(ts, used_symbol, float(r.open), float(r.high), float(r.low), float(r.close), float(r.volume), source=used_source)
         rows += 1
     chop_result = refresh_all_chop_metrics()
-    log_event("bootstrap", f"Bootstrapped {rows} candles", {"ticker": TICKER, "period": BOOTSTRAP_PERIOD, "chop_backfill": chop_result})
-    return {"ok": True, "message": f"Bootstrapped {rows} candles", "candles": rows, "chop_backfill": chop_result}
+    log_event("bootstrap", f"Bootstrapped {rows} candles", {"source": used_source, "symbol": used_symbol, "period": used_period, "method": used_method, "chop_backfill": chop_result})
+    return {
+        "ok": True,
+        "version": APP_VERSION,
+        "message": f"Bootstrapped {rows} candles",
+        "candles": rows,
+        "source": used_source,
+        "symbol": used_symbol,
+        "period": used_period,
+        "method": used_method,
+        "attempts": all_attempts[-20:],
+        "chop_backfill": chop_result,
+    }
 
 
 def table_df(table):
@@ -797,7 +1051,10 @@ def health():
     return jsonify({
         "ok": True,
         "app": APP_NAME,
+        "version": APP_VERSION,
         "db_path": DB_PATH,
+        "bootstrap_ticker": TICKER,
+        "bootstrap_period": BOOTSTRAP_PERIOD,
         "candles": int(len(candles)),
         "trades": int(len(trades)),
         "latest_candle": None if candles.empty else candles["timestamp"].max(),
@@ -808,7 +1065,9 @@ def health():
 @app.route("/bootstrap")
 def bootstrap_route():
     force = request.args.get("force", "false").lower() in ("1", "true", "yes")
-    result = bootstrap_yfinance(force=force)
+    ticker = request.args.get("ticker") or TICKER
+    period = request.args.get("period") or BOOTSTRAP_PERIOD
+    result = bootstrap_yfinance(force=force, ticker=ticker, period=period)
     return jsonify(result)
 
 
