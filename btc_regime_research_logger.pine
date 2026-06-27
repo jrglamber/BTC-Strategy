@@ -1,0 +1,117 @@
+//@version=5
+indicator("BTC Regime Research Logger", overlay=true, max_labels_count=500)
+
+// Use on a BTC 1h chart. Create an alert on this script using:
+// Condition: Any alert() function call
+// Frequency: Once Per Bar Close
+// Webhook URL: https://YOUR-RAILWAY-APP.up.railway.app/webhook
+
+secret = input.string("change-me", "Webhook secret")
+showVisuals = input.bool(true, "Show visual candidate markers")
+
+f_ctx() =>
+    e8 = ta.ema(close, 8)
+    e21 = ta.ema(close, 21)
+    e55 = ta.ema(close, 55)
+    e144 = ta.ema(close, 144)
+    r = ta.rsi(close, 14)
+    a = ta.atr(14)
+    macd = ta.ema(close, 12) - ta.ema(close, 26)
+    macdSig = ta.ema(macd, 9)
+
+    bullScore =
+         (close > e8 ? 1 : 0) +
+         (close > e21 ? 1 : 0) +
+         (close > e55 ? 1 : 0) +
+         (close > e144 ? 1 : 0) +
+         (e8 > e21 ? 1 : 0) +
+         (e21 > e55 ? 1 : 0) +
+         (e55 > e144 ? 1 : 0) +
+         (e21 > e21[3] ? 1 : 0) +
+         (r > 50 ? 1 : 0) +
+         (macd > macdSig ? 1 : 0)
+
+    bearScore =
+         (close < e8 ? 1 : 0) +
+         (close < e21 ? 1 : 0) +
+         (close < e55 ? 1 : 0) +
+         (close < e144 ? 1 : 0) +
+         (e8 < e21 ? 1 : 0) +
+         (e21 < e55 ? 1 : 0) +
+         (e55 < e144 ? 1 : 0) +
+         (e21 < e21[3] ? 1 : 0) +
+         (r < 50 ? 1 : 0) +
+         (macd < macdSig ? 1 : 0)
+
+    bullStack = e8 > e21 and e21 > e55 and e55 > e144
+    bearStack = e8 < e21 and e21 < e55 and e55 < e144
+    regime = bullScore >= 7 and bullStack ? 1 : bearScore >= 7 and bearStack ? -1 : 0
+    bullAge = regime == 1 ? ta.barssince(regime != 1) : na
+    bearAge = regime == -1 ? ta.barssince(regime != -1) : na
+    stretch = math.max(2.0 * (a / close), 0.04)
+    dist21 = (close - e21) / close
+    farUp = dist21 > stretch
+    farDown = dist21 < -stretch
+    [regime, bullScore, bearScore, bullAge, bearAge, farUp, farDown]
+
+f_exec_short() =>
+    close < ta.lowest(low, 20)[1] and close < ta.ema(close, 21) and ta.rsi(close, 14) <= 45
+
+[ctx4Reg, ctx4BullScore, ctx4BearScore, ctx4BullAge, ctx4BearAge, ctx4FarUp, ctx4FarDown] = request.security(syminfo.tickerid, "240", f_ctx(), barmerge.gaps_off, barmerge.lookahead_off)
+[ctx8Reg, ctx8BullScore, ctx8BearScore, ctx8BullAge, ctx8BearAge, ctx8FarUp, ctx8FarDown] = request.security(syminfo.tickerid, "480", f_ctx(), barmerge.gaps_off, barmerge.lookahead_off)
+
+ema8 = ta.ema(close, 8)
+ema21 = ta.ema(close, 21)
+ema55 = ta.ema(close, 55)
+rsi14 = ta.rsi(close, 14)
+rollLow20 = ta.lowest(low, 20)[1]
+
+estBear8 = ctx8Reg == -1 and ctx8BearAge > 2 and ctx8BearAge <= 6
+estBull4 = ctx4Reg == 1 and ctx4BullAge > 2 and ctx4BullAge <= 6
+
+shortA_1h = estBear8 and close < rollLow20 and close < ema21 and rsi14 <= 45
+longC_1h = estBull4 and low <= ema21 and close > ema8 and close > open and close > ema55 and rsi14 >= 45
+
+short2hRaw = request.security(syminfo.tickerid, "120", f_exec_short(), barmerge.gaps_off, barmerge.lookahead_off)
+time2hClose = request.security(syminfo.tickerid, "120", time_close, barmerge.gaps_off, barmerge.lookahead_off)
+new2hClose = ta.change(time2hClose) != 0
+shortB_2h = estBear8 and short2hRaw and new2hClose
+
+bgcolor(ctx8Reg == -1 ? color.new(color.red, 88) : ctx4Reg == 1 ? color.new(color.green, 90) : na)
+plotshape(showVisuals and shortA_1h, title="Short A 1h", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.tiny, text="S1")
+plotshape(showVisuals and shortB_2h, title="Short B 2h", style=shape.triangledown, location=location.abovebar, color=color.orange, size=size.tiny, text="S2")
+plotshape(showVisuals and longC_1h, title="Long C 1h", style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.tiny, text="L")
+
+var table t = table.new(position.top_right, 2, 6, border_width=1)
+if barstate.islast
+    table.cell(t, 0, 0, "8h regime")
+    table.cell(t, 1, 0, ctx8Reg == -1 ? "BEAR" : ctx8Reg == 1 ? "BULL" : "NEUTRAL")
+    table.cell(t, 0, 1, "8h bear age")
+    table.cell(t, 1, 1, str.tostring(ctx8BearAge))
+    table.cell(t, 0, 2, "Short A")
+    table.cell(t, 1, 2, shortA_1h ? "YES" : "no")
+    table.cell(t, 0, 3, "Short B")
+    table.cell(t, 1, 3, shortB_2h ? "YES" : "no")
+    table.cell(t, 0, 4, "4h regime")
+    table.cell(t, 1, 4, ctx4Reg == 1 ? "BULL" : ctx4Reg == -1 ? "BEAR" : "NEUTRAL")
+    table.cell(t, 0, 5, "Long C")
+    table.cell(t, 1, 5, longC_1h ? "YES" : "no")
+
+payload = "{" +
+     "\"secret\":\"" + secret + "\"," +
+     "\"symbol\":\"" + syminfo.ticker + "\"," +
+     "\"time\":" + str.tostring(time) + "," +
+     "\"time_close\":" + str.tostring(time_close) + "," +
+     "\"timeframe\":\"" + timeframe.period + "\"," +
+     "\"open\":" + str.tostring(open) + "," +
+     "\"high\":" + str.tostring(high) + "," +
+     "\"low\":" + str.tostring(low) + "," +
+     "\"close\":" + str.tostring(close) + "," +
+     "\"volume\":" + str.tostring(volume) + "," +
+     "\"shortA_1h\":" + (shortA_1h ? "true" : "false") + "," +
+     "\"shortB_2h\":" + (shortB_2h ? "true" : "false") + "," +
+     "\"longC_1h\":" + (longC_1h ? "true" : "false") +
+     "}"
+
+if barstate.isconfirmed
+    alert(payload, alert.freq_once_per_bar_close)
