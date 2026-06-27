@@ -18,7 +18,7 @@ except Exception:
     yf = None
 
 APP_NAME = "BTC Regime Research Logger"
-APP_VERSION = "v5_webhook_secret_payload"
+APP_VERSION = "v6_extended_runner_tracking"
 DB_PATH = os.getenv("DB_PATH", "/data/btc_research.sqlite" if os.path.exists("/data") else "btc_research.sqlite")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
 BOOTSTRAP_ON_START = os.getenv("BOOTSTRAP_ON_START", "true").lower() in ("1", "true", "yes", "y")
@@ -28,6 +28,11 @@ TICKER = os.getenv("BOOTSTRAP_TICKER", "BTC-USD")
 HOLD_HOURS = [12, 24, 48, 72, 96]
 STOP_MULTS = [1.0, 1.5, 2.0, 3.0]
 MIN_STOP_PCT = 0.0075
+
+# 96h is a fixed research checkpoint, not a forced live-style exit.
+# Profitable trades at 96h are tracked as extended runners while the trend remains valid.
+RUNNER_GIVEBACK_LIMIT_PCT = float(os.getenv("RUNNER_GIVEBACK_LIMIT_PCT", "40"))
+
 
 # Chop / trend-clean research tags. These do not block trades yet; they are logged for later analysis.
 CHOP_LOOKBACK = int(os.getenv("CHOP_LOOKBACK", "24"))
@@ -203,6 +208,21 @@ def init_db():
                 ret_48h_pct REAL,
                 ret_72h_pct REAL,
                 ret_96h_pct REAL,
+                runner_eligible INTEGER DEFAULT 0,
+                runner_status TEXT DEFAULT 'NONE',
+                runner_started_at TEXT,
+                runner_age_hours REAL,
+                runner_regime TEXT,
+                runner_chop_state TEXT,
+                runner_chop_score REAL,
+                post_96_current_return_pct REAL,
+                post_96_mfe_pct REAL,
+                post_96_mae_pct REAL,
+                post_96_high_water_pct REAL,
+                post_96_giveback_pct REAL,
+                runner_exit_time TEXT,
+                runner_exit_reason TEXT,
+                runner_exit_return_pct REAL,
                 status TEXT DEFAULT 'OPEN',
                 updated_at TEXT,
                 UNIQUE(model, signal_time)
@@ -239,6 +259,21 @@ def init_db():
             "atr_compression_ratio": "REAL",
             "failed_breakout_flag": "INTEGER DEFAULT 0",
             "trend_clean_flag": "INTEGER DEFAULT 0",
+            "runner_eligible": "INTEGER DEFAULT 0",
+            "runner_status": "TEXT DEFAULT 'NONE'",
+            "runner_started_at": "TEXT",
+            "runner_age_hours": "REAL",
+            "runner_regime": "TEXT",
+            "runner_chop_state": "TEXT",
+            "runner_chop_score": "REAL",
+            "post_96_current_return_pct": "REAL",
+            "post_96_mfe_pct": "REAL",
+            "post_96_mae_pct": "REAL",
+            "post_96_high_water_pct": "REAL",
+            "post_96_giveback_pct": "REAL",
+            "runner_exit_time": "TEXT",
+            "runner_exit_reason": "TEXT",
+            "runner_exit_return_pct": "REAL",
         })
         conn.commit()
 
@@ -684,12 +719,50 @@ def stop_price(side, entry, risk_pct):
     return entry * (1 - risk_pct) if side == "LONG" else entry * (1 + risk_pct)
 
 
+def latest_context_snapshot(candles, context_tf):
+    """Latest context regime snapshot for runner management."""
+    try:
+        ctx = add_context_indicators(resample_ohlcv(candles, context_tf)).dropna(subset=["ctx_regime"])
+        if ctx.empty:
+            return {"ctx_regime": "UNKNOWN", "ctx_bull_age": None, "ctx_bear_age": None}
+        row = ctx.iloc[-1]
+        return {
+            "ctx_regime": str(row.get("ctx_regime", "UNKNOWN")),
+            "ctx_bull_age": safe_float(row.get("ctx_bull_age")),
+            "ctx_bear_age": safe_float(row.get("ctx_bear_age")),
+            "ctx_bull_score": safe_float(row.get("ctx_bull_score")),
+            "ctx_bear_score": safe_float(row.get("ctx_bear_score")),
+        }
+    except Exception as e:
+        log_event("runner_context_error", str(e), {"context_tf": context_tf})
+        return {"ctx_regime": "UNKNOWN", "ctx_bull_age": None, "ctx_bear_age": None}
+
+
+def latest_chop_snapshot(candles):
+    """Latest 1h chop state for runner monitoring."""
+    try:
+        frame = add_exec_indicators(candles).dropna(subset=["close"])
+        if frame.empty:
+            return {"chop_state": "UNKNOWN", "chop_score": None}
+        row = frame.iloc[-1]
+        return {
+            "chop_state": str(row.get("chop_state", "UNKNOWN")),
+            "chop_score": safe_float(row.get("chop_score")),
+        }
+    except Exception as e:
+        log_event("runner_chop_error", str(e), {})
+        return {"chop_state": "UNKNOWN", "chop_score": None}
+
+
 def update_all_trades():
     candles = load_candles_df()
     if candles.empty:
         return
     latest_close = float(candles["close"].iloc[-1])
     latest_ts = candles.index.max()
+    ctx_cache = {}
+    chop_now = latest_chop_snapshot(candles)
+
     with connect() as conn:
         trades = conn.execute("SELECT * FROM shadow_trades WHERE status != 'ARCHIVED' ORDER BY entry_time").fetchall()
         for t in trades:
@@ -709,13 +782,15 @@ def update_all_trades():
                 mfe_pct = (entry - float(window["low"].min())) / entry * 100.0
                 mae_pct = (entry - float(window["high"].max())) / entry * 100.0
 
+            age_hours = (latest_ts - entry_time).total_seconds() / 3600.0
             updates = {
                 "current_price": current,
                 "current_return_pct": current_ret,
                 "mfe_pct": mfe_pct,
                 "mae_pct": mae_pct,
+                "runner_age_hours": age_hours if age_hours >= 96 else None,
                 "updated_at": now_iso(),
-                "status": "COMPLETE" if latest_ts >= entry_time + pd.Timedelta(hours=96) else "OPEN",
+                "status": "OPEN",
             }
 
             risk_2 = max(2.0 * entry_atr_pct, MIN_STOP_PCT)
@@ -746,6 +821,7 @@ def update_all_trades():
                         updates[col] = 1
                         updates[time_col] = iso(hit.index.min())
 
+            # Fixed research checkpoints. These are measurement points, not forced live-style exits.
             for h in HOLD_HOURS:
                 col = f"ret_{h}h_pct"
                 if t[col] is None and latest_ts >= entry_time + pd.Timedelta(hours=h):
@@ -755,11 +831,92 @@ def update_all_trades():
                         exit_price = float(exit_rows["close"].iloc[-1])
                         updates[col] = trade_return_pct(side, entry, exit_price)
 
+            # Extended runner layer. If the trade is profitable at 96h, keep tracking it as a
+            # live-style runner while the broad context remains aligned. This does not replace
+            # ret_96h_pct; it adds the information needed to decide later whether 96h was too early.
+            ret96 = updates.get("ret_96h_pct", t["ret_96h_pct"])
+            try:
+                ret96_float = None if ret96 is None else float(ret96)
+            except Exception:
+                ret96_float = None
+
+            if latest_ts >= entry_time + pd.Timedelta(hours=96):
+                runner_start = entry_time + pd.Timedelta(hours=96)
+                if ret96_float is not None and ret96_float > 0:
+                    context_tf = t["context_tf"] or "8h"
+                    if context_tf not in ctx_cache:
+                        ctx_cache[context_tf] = latest_context_snapshot(candles, context_tf)
+                    ctx_now = ctx_cache[context_tf]
+                    desired_regime = "BULL" if side == "LONG" else "BEAR"
+                    current_regime = ctx_now.get("ctx_regime", "UNKNOWN")
+
+                    post_window = candles[candles.index > runner_start]
+                    if post_window.empty:
+                        post_mfe = current_ret
+                        post_mae = current_ret
+                    elif side == "LONG":
+                        post_mfe = (float(post_window["high"].max()) - entry) / entry * 100.0
+                        post_mae = (float(post_window["low"].min()) - entry) / entry * 100.0
+                    else:
+                        post_mfe = (entry - float(post_window["low"].min())) / entry * 100.0
+                        post_mae = (entry - float(post_window["high"].max())) / entry * 100.0
+
+                    prior_high_water = safe_float(t["post_96_high_water_pct"])
+                    high_water = max([x for x in [prior_high_water, post_mfe, current_ret, ret96_float] if x is not None])
+                    giveback_pct = 0.0 if high_water <= 0 else max(0.0, (high_water - current_ret) / high_water * 100.0)
+
+                    updates.update({
+                        "runner_eligible": 1,
+                        "runner_started_at": t["runner_started_at"] or iso(runner_start),
+                        "runner_regime": current_regime,
+                        "runner_chop_state": chop_now.get("chop_state"),
+                        "runner_chop_score": chop_now.get("chop_score"),
+                        "post_96_current_return_pct": current_ret,
+                        "post_96_mfe_pct": post_mfe,
+                        "post_96_mae_pct": post_mae,
+                        "post_96_high_water_pct": high_water,
+                        "post_96_giveback_pct": giveback_pct,
+                    })
+
+                    already_exited = bool(t["runner_exit_reason"])
+                    exit_reason = None
+                    if not already_exited:
+                        if current_ret <= 0:
+                            exit_reason = "lost_profit"
+                        elif current_ret < ret96_float:
+                            exit_reason = "below_96h_checkpoint"
+                        elif current_regime == "UNKNOWN":
+                            exit_reason = None  # do not simulate a close just because context could not be calculated
+                        elif current_regime != desired_regime:
+                            exit_reason = "trend_lost" if current_regime == "NEUTRAL" else "opposite_regime"
+                        elif giveback_pct >= RUNNER_GIVEBACK_LIMIT_PCT:
+                            exit_reason = "major_giveback"
+
+                    if already_exited:
+                        updates["runner_status"] = "ENDED"
+                        updates["status"] = "RUNNER_CLOSED"
+                    elif exit_reason:
+                        updates.update({
+                            "runner_status": "ENDED",
+                            "runner_exit_time": iso(latest_ts),
+                            "runner_exit_reason": exit_reason,
+                            "runner_exit_return_pct": current_ret,
+                            "status": "RUNNER_CLOSED",
+                        })
+                    else:
+                        updates["runner_status"] = "ACTIVE"
+                        updates["status"] = "EXTENDED_RUNNER"
+                else:
+                    updates.update({
+                        "runner_eligible": 0,
+                        "runner_status": "NOT_ELIGIBLE",
+                        "status": "COMPLETE_96",
+                    })
+
             set_clause = ", ".join([f"{k}=?" for k in updates.keys()])
             vals = list(updates.values()) + [t["id"]]
             conn.execute(f"UPDATE shadow_trades SET {set_clause} WHERE id=?", vals)
         conn.commit()
-
 
 def _normalise_yfinance_ohlcv(raw):
     """Return a clean OHLCV dataframe from yfinance output, or empty dataframe."""
@@ -1048,6 +1205,8 @@ def table_df(table):
 def health():
     candles = table_df("candles_1h")
     trades = table_df("shadow_trades")
+    active_runners = 0 if trades.empty or "runner_status" not in trades.columns else int((trades["runner_status"] == "ACTIVE").sum())
+    runner_closed = 0 if trades.empty or "runner_status" not in trades.columns else int((trades["runner_status"] == "ENDED").sum())
     return jsonify({
         "ok": True,
         "app": APP_NAME,
@@ -1057,6 +1216,8 @@ def health():
         "bootstrap_period": BOOTSTRAP_PERIOD,
         "candles": int(len(candles)),
         "trades": int(len(trades)),
+        "active_runners": active_runners,
+        "runner_closed": runner_closed,
         "latest_candle": None if candles.empty else candles["timestamp"].max(),
         "models": [m["model"] for m in MODEL_SPECS],
     })
@@ -1148,15 +1309,21 @@ def dashboard_data():
         for col in [
             "current_return_pct", "ret_24h_pct", "ret_48h_pct", "ret_72h_pct", "ret_96h_pct",
             "mfe_pct", "mae_pct", "chop_score", "stop_2atr_hit", "reached_1r_2atr", "trend_clean_flag",
+            "runner_age_hours", "post_96_current_return_pct", "post_96_mfe_pct", "post_96_mae_pct",
+            "post_96_high_water_pct", "post_96_giveback_pct", "runner_exit_return_pct",
         ]:
             if col in trades.columns:
                 trades[col] = pd.to_numeric(trades[col], errors="coerce")
         summary = trades.groupby(["model", "side"]).agg(
             trades=("id", "count"),
             open=("status", lambda x: int((x == "OPEN").sum())),
+            active_runners=("runner_status", lambda x: int((x == "ACTIVE").sum())),
+            runner_closed=("runner_status", lambda x: int((x == "ENDED").sum())),
             avg_24h=("ret_24h_pct", "mean"),
             avg_48h=("ret_48h_pct", "mean"),
             avg_96h=("ret_96h_pct", "mean"),
+            avg_post_96_high_water=("post_96_high_water_pct", "mean"),
+            avg_post_96_giveback=("post_96_giveback_pct", "mean"),
             stop_2atr_rate=("stop_2atr_hit", lambda x: 100.0 * pd.to_numeric(x, errors="coerce").fillna(0).mean()),
             reached_1r_rate=("reached_1r_2atr", lambda x: 100.0 * pd.to_numeric(x, errors="coerce").fillna(0).mean()),
         ).reset_index()
@@ -1164,10 +1331,14 @@ def dashboard_data():
             chop_summary = trades.groupby(["model", "side", "chop_state"], dropna=False).agg(
                 trades=("id", "count"),
                 open=("status", lambda x: int((x == "OPEN").sum())),
+                active_runners=("runner_status", lambda x: int((x == "ACTIVE").sum())),
+                runner_closed=("runner_status", lambda x: int((x == "ENDED").sum())),
                 avg_chop_score=("chop_score", "mean"),
                 avg_24h=("ret_24h_pct", "mean"),
                 avg_48h=("ret_48h_pct", "mean"),
                 avg_96h=("ret_96h_pct", "mean"),
+                avg_post_96_high_water=("post_96_high_water_pct", "mean"),
+                avg_post_96_giveback=("post_96_giveback_pct", "mean"),
                 stop_2atr_rate=("stop_2atr_hit", lambda x: 100.0 * pd.to_numeric(x, errors="coerce").fillna(0).mean()),
                 reached_1r_rate=("reached_1r_2atr", lambda x: 100.0 * pd.to_numeric(x, errors="coerce").fillna(0).mean()),
             ).reset_index()
@@ -1187,6 +1358,8 @@ def index():
     total_trades = 0 if trades.empty else len(trades)
     open_trades = 0 if trades.empty else int((trades["status"] == "OPEN").sum())
     completed_96 = 0 if trades.empty else int(trades["ret_96h_pct"].notna().sum())
+    active_runners = 0 if trades.empty or "runner_status" not in trades.columns else int((trades["runner_status"] == "ACTIVE").sum())
+    runner_closed = 0 if trades.empty or "runner_status" not in trades.columns else int((trades["runner_status"] == "ENDED").sum())
     latest_price = "—" if latest is None else fmt(latest.get("close"), 2)
     latest_time = "—" if latest is None else latest.get("timestamp")
     latest_chop_state = "—" if latest is None else (latest.get("chop_state_1h") or "—")
@@ -1211,7 +1384,9 @@ def index():
         cols=[
             "id", "model", "side", "signal_time", "entry_price", "chop_state", "chop_score",
             "trend_clean_flag", "failed_breakout_flag", "current_return_pct", "mfe_pct", "mae_pct",
-            "ret_24h_pct", "ret_48h_pct", "ret_96h_pct", "stop_2atr_hit", "reached_1r_2atr", "status",
+            "ret_24h_pct", "ret_48h_pct", "ret_96h_pct", "runner_status", "runner_age_hours",
+            "post_96_high_water_pct", "post_96_giveback_pct", "runner_regime", "runner_chop_state",
+            "runner_exit_reason", "runner_exit_return_pct", "stop_2atr_hit", "reached_1r_2atr", "status",
         ],
         max_rows=30,
     )
@@ -1253,11 +1428,13 @@ def index():
       <div class="card"><div class="muted">Shadow trades</div><div class="big">{total_trades}</div></div>
       <div class="card"><div class="muted">Open trades</div><div class="big">{open_trades}</div></div>
       <div class="card"><div class="muted">96h completed</div><div class="big">{completed_96}</div></div>
+      <div class="card"><div class="muted">Active runners</div><div class="big">{active_runners}</div></div>
+      <div class="card"><div class="muted">Runner closed</div><div class="big">{runner_closed}</div></div>
     </div>
     <div class="card"><b>Models:</b><br>{''.join([f'<span class="pill">{m["label"]}</span>' for m in MODEL_SPECS])}</div>
     {section('Model Summary', summary_html)}
     {section('Chop / Trend-Clean Summary', chop_summary_html, 'Research tag only. Trades are still logged in TREND, MIXED, and CHOP so we can later test whether chop should block stacking.')}
-    {section('Latest Shadow Trades', latest_html)}
+    {section('Latest Shadow Trades / Runners', latest_html, '96h remains a fixed research checkpoint. Profitable trades at 96h are also tracked as EXTENDED_RUNNER while trend remains valid.')}
     {section('Recent Events', events_html)}
     </body></html>
     """
