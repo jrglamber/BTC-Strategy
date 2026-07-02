@@ -18,7 +18,7 @@ except Exception:
     yf = None
 
 APP_NAME = "BTC Regime Research Logger"
-APP_VERSION = "v6_extended_runner_tracking"
+APP_VERSION = "v7_core_plus_expansion_models"
 DB_PATH = os.getenv("DB_PATH", "/data/btc_research.sqlite" if os.path.exists("/data") else "btc_research.sqlite")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
 BOOTSTRAP_ON_START = os.getenv("BOOTSTRAP_ON_START", "true").lower() in ("1", "true", "yes", "y")
@@ -44,9 +44,11 @@ FRESH_CONTEXT_BARS = 2
 ESTABLISHED_MAX_CONTEXT_BARS = 6
 
 MODEL_SPECS = [
+    # CORE frozen BTC models from the first BTC pass. Keep these separated in analysis.
     {
         "model": "BTC_SHORT_A_1H_8H_BREAKOUT_EST_BEAR",
-        "label": "Short A: 1h/8h established BEAR breakdown",
+        "label": "CORE Short A: 1h/8h established BEAR breakdown",
+        "group": "CORE",
         "exec_tf": "1h",
         "context_tf": "8h",
         "family": "breakout_continuation",
@@ -55,7 +57,8 @@ MODEL_SPECS = [
     },
     {
         "model": "BTC_SHORT_B_2H_8H_BREAKOUT_EST_BEAR",
-        "label": "Short B: 2h/8h established BEAR breakdown",
+        "label": "CORE Short B: 2h/8h established BEAR breakdown",
+        "group": "CORE",
         "exec_tf": "2h",
         "context_tf": "8h",
         "family": "breakout_continuation",
@@ -64,12 +67,56 @@ MODEL_SPECS = [
     },
     {
         "model": "BTC_LONG_C_1H_4H_PULLBACK_EST_BULL",
-        "label": "Long C: 1h/4h established BULL pullback reclaim",
+        "label": "CORE Long C: 1h/4h established BULL pullback reclaim",
+        "group": "CORE",
         "exec_tf": "1h",
         "context_tf": "4h",
         "family": "pullback_reclaim",
         "side": "LONG",
         "age_bucket": "established",
+    },
+
+    # EXPANSION models. These answer the basket-style question:
+    # should BTC continue opening small trades during mature but still-valid trends?
+    {
+        "model": "BTC_SHORT_D_1H_8H_BREAKOUT_MATURE_BEAR",
+        "label": "EXP Short D: 1h/8h mature BEAR breakdown",
+        "group": "EXPANSION",
+        "exec_tf": "1h",
+        "context_tf": "8h",
+        "family": "breakout_continuation",
+        "side": "SHORT",
+        "age_bucket": "mature",
+    },
+    {
+        "model": "BTC_SHORT_E_2H_8H_BREAKOUT_MATURE_BEAR",
+        "label": "EXP Short E: 2h/8h mature BEAR breakdown",
+        "group": "EXPANSION",
+        "exec_tf": "2h",
+        "context_tf": "8h",
+        "family": "breakout_continuation",
+        "side": "SHORT",
+        "age_bucket": "mature",
+    },
+    {
+        "model": "BTC_LONG_D_1H_4H_PULLBACK_MATURE_BULL",
+        "label": "EXP Long D: 1h/4h mature BULL pullback reclaim",
+        "group": "EXPANSION",
+        "exec_tf": "1h",
+        "context_tf": "4h",
+        "family": "pullback_reclaim",
+        "side": "LONG",
+        "age_bucket": "mature",
+    },
+    {
+        "model": "BTC_LONG_E_1H_8H_BREAKOUT_MATURE_BULL",
+        "label": "EXP Long E: 1h/8h mature BULL breakout",
+        "group": "EXPANSION",
+        "exec_tf": "1h",
+        "context_tf": "8h",
+        "family": "breakout_continuation",
+        "side": "LONG",
+        "age_bucket": "mature",
     },
 ]
 
@@ -540,6 +587,8 @@ def model_candidate(row, spec):
 
     if family == "breakout_continuation" and side == "SHORT":
         ok = (row["close"] < row["roll_low20"]) and (row["close"] < row["ema21"]) and (row["rsi14"] <= 45)
+    elif family == "breakout_continuation" and side == "LONG":
+        ok = (row["close"] > row["roll_high20"]) and (row["close"] > row["ema21"]) and (row["rsi14"] >= 55)
     elif family == "pullback_reclaim" and side == "LONG":
         ok = (row["low"] <= row["ema21"]) and (row["close"] > row["ema8"]) and (row["close"] > row["open"]) and (row["close"] > row["ema55"]) and (row["rsi14"] >= 45)
     else:
@@ -659,7 +708,7 @@ def process_latest_candle():
             row = frame.iloc[-1]
             ok, ctx_age, bucket, far_now = model_candidate(row, spec)
             states.append({
-                "model": spec["model"], "candidate": ok, "side": spec["side"], "ctx_regime": row.get("ctx_regime"),
+                "model": spec["model"], "group": spec.get("group", "CORE"), "candidate": ok, "side": spec["side"], "ctx_regime": row.get("ctx_regime"),
                 "ctx_age": None if pd.isna(ctx_age) else float(ctx_age), "age_bucket": bucket,
                 "ctx_bull_score": float(row.get("ctx_bull_score", np.nan)), "ctx_bear_score": float(row.get("ctx_bear_score", np.nan)),
                 "ctx_far_now": far_now, "close": float(row["close"]), "time": str(latest_exec_ts),
@@ -1431,7 +1480,7 @@ def index():
       <div class="card"><div class="muted">Active runners</div><div class="big">{active_runners}</div></div>
       <div class="card"><div class="muted">Runner closed</div><div class="big">{runner_closed}</div></div>
     </div>
-    <div class="card"><b>Models:</b><br>{''.join([f'<span class="pill">{m["label"]}</span>' for m in MODEL_SPECS])}</div>
+    <div class="card"><b>Models:</b><br>{''.join([f'<span class="pill">{m["label"]}</span>' for m in MODEL_SPECS])}<div class="small muted">CORE models remain the original frozen BTC set. EXP models are research-only mature-trend stacking tests.</div></div>
     {section('Model Summary', summary_html)}
     {section('Chop / Trend-Clean Summary', chop_summary_html, 'Research tag only. Trades are still logged in TREND, MIXED, and CHOP so we can later test whether chop should block stacking.')}
     {section('Latest Shadow Trades / Runners', latest_html, '96h remains a fixed research checkpoint. Profitable trades at 96h are also tracked as EXTENDED_RUNNER while trend remains valid.')}
